@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
@@ -870,6 +872,72 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 
 		return results, nil
 	})
+
+	// Apply ORDER BY
+	if len(stmt.SortClause) > 0 {
+		sortBy := stmt.SortClause[0].GetSortBy()
+		if sortBy != nil {
+			sortColName := sortBy.Node.GetColumnRef().Fields[0].GetString_().GetSval()
+			sortColIdx := -1
+			for i, name := range results.fieldNames {
+				if name == sortColName {
+					sortColIdx = i
+					break
+				}
+			}
+
+			if sortColIdx >= 0 {
+				isDesc := sortBy.SortbyDir == pgquery.SortByDir_SORTBY_DESC
+
+				sort.SliceStable(results.rows, func(i, j int) bool {
+					vi := fmt.Sprintf("%v", results.rows[i][sortColIdx])
+					vj := fmt.Sprintf("%v", results.rows[j][sortColIdx])
+
+					// Try numeric comparison first
+					ni, errI := strconv.ParseFloat(vi, 64)
+					nj, errJ := strconv.ParseFloat(vj, 64)
+					if errI == nil && errJ == nil {
+						if isDesc {
+							return ni > nj
+						}
+						return ni < nj
+					}
+
+					// Fall back to string comparison
+					if isDesc {
+						return vi > vj
+					}
+					return vi < vj
+				})
+			}
+		}
+	}
+
+	// Apply LIMIT
+	if stmt.LimitCount != nil {
+		if limitConst := stmt.LimitCount.GetAConst(); limitConst != nil {
+			if limitVal := limitConst.GetIval(); limitVal != nil {
+				limit := int(limitVal.GetIval())
+				if limit < len(results.rows) {
+					results.rows = results.rows[:limit]
+				}
+			}
+		}
+	}
+
+	// Apply OFFSET
+	if stmt.LimitOffset != nil {
+		if offsetConst := stmt.LimitOffset.GetAConst(); offsetConst != nil {
+			if offsetVal := offsetConst.GetIval(); offsetVal != nil {
+				offset := int(offsetVal.GetIval())
+				if offset < len(results.rows) {
+					results.rows = results.rows[offset:]
+				} else {
+					results.rows = nil
+				}
+			}
+		}
+	}
 
 	return results, nil
 }

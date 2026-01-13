@@ -190,7 +190,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (3, 'charlie'), (1, 'alice'), (2, 'bob')"},
 		MainSQL:  "SELECT id, name FROM users ORDER BY id ASC",
 		Tags:     []string{"dml", "select", "order-by"},
-		Skip:     "ORDER BY not implemented",
 	},
 	{
 		Name:     "select_order_by_desc",
@@ -198,7 +197,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')"},
 		MainSQL:  "SELECT id, name FROM users ORDER BY id DESC",
 		Tags:     []string{"dml", "select", "order-by"},
-		Skip:     "ORDER BY not implemented",
 	},
 
 	// LIMIT/OFFSET
@@ -208,7 +206,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')"},
 		MainSQL:  "SELECT id, name FROM users LIMIT 2",
 		Tags:     []string{"dml", "select", "limit"},
-		Skip:     "LIMIT not implemented",
 	},
 	{
 		Name:     "select_offset",
@@ -216,7 +213,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')"},
 		MainSQL:  "SELECT id, name FROM users LIMIT 2 OFFSET 1",
 		Tags:     []string{"dml", "select", "limit", "offset"},
-		Skip:     "LIMIT/OFFSET not implemented",
 	},
 
 	// Expressions
