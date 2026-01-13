@@ -89,7 +89,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice')"},
 		MainSQL:  "SELECT * FROM users",
 		Tags:     []string{"dml", "select", "select-star"},
-		Skip:     "SELECT * not implemented",
 	},
 
 	// DML - DELETE
@@ -134,7 +133,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob')"},
 		MainSQL:  "SELECT id, name FROM users WHERE id = 1",
 		Tags:     []string{"dml", "select", "where"},
-		Skip:     "WHERE clause not implemented",
 	},
 	{
 		Name:     "select_where_eq_text",
@@ -142,7 +140,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob')"},
 		MainSQL:  "SELECT id, name FROM users WHERE name = 'alice'",
 		Tags:     []string{"dml", "select", "where"},
-		Skip:     "WHERE clause not implemented",
 	},
 	{
 		Name:     "select_where_neq",
@@ -150,7 +147,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob')"},
 		MainSQL:  "SELECT id, name FROM users WHERE id <> 1",
 		Tags:     []string{"dml", "select", "where"},
-		Skip:     "WHERE clause not implemented",
 	},
 	{
 		Name:     "select_where_gt",
@@ -158,7 +154,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')"},
 		MainSQL:  "SELECT id, name FROM users WHERE id > 1",
 		Tags:     []string{"dml", "select", "where"},
-		Skip:     "WHERE clause not implemented",
 	},
 	{
 		Name:     "select_where_lt",
@@ -166,7 +161,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')"},
 		MainSQL:  "SELECT id, name FROM users WHERE id < 3",
 		Tags:     []string{"dml", "select", "where"},
-		Skip:     "WHERE clause not implemented",
 	},
 	{
 		Name:     "select_where_and",
@@ -174,7 +168,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'alice')"},
 		MainSQL:  "SELECT id, name FROM users WHERE id > 1 AND name = 'alice'",
 		Tags:     []string{"dml", "select", "where"},
-		Skip:     "WHERE clause not implemented",
 	},
 	{
 		Name:     "select_where_or",
@@ -182,7 +175,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')"},
 		MainSQL:  "SELECT id, name FROM users WHERE id = 1 OR id = 3",
 		Tags:     []string{"dml", "select", "where"},
-		Skip:     "WHERE clause not implemented",
 	},
 
 	// DDL - DROP TABLE

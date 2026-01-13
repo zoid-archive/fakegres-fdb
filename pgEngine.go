@@ -330,6 +330,105 @@ type pgResult struct {
 	rows       [][]any
 }
 
+// evaluateWhereExpr evaluates a WHERE expression against a row
+// Returns true if the row matches the condition
+func evaluateWhereExpr(expr *pgquery.Node, rowData map[string]string) (bool, error) {
+	if expr == nil {
+		return true, nil
+	}
+
+	// Handle A_Expr (comparison operators like =, <>, <, >, <=, >=)
+	if aExpr := expr.GetAExpr(); aExpr != nil {
+		// Get column name from left side
+		leftColRef := aExpr.Lexpr.GetColumnRef()
+		if leftColRef == nil || len(leftColRef.Fields) == 0 {
+			return false, fmt.Errorf("left side of comparison must be a column")
+		}
+		colName := leftColRef.Fields[0].GetString_().GetSval()
+
+		// Get value from right side
+		rightConst := aExpr.Rexpr.GetAConst()
+		if rightConst == nil {
+			return false, fmt.Errorf("right side of comparison must be a constant")
+		}
+
+		var compareVal string
+		if sval := rightConst.GetSval(); sval != nil {
+			compareVal = sval.GetSval()
+		} else if ival := rightConst.GetIval(); ival != nil {
+			compareVal = fmt.Sprintf("%d", ival.GetIval())
+		} else {
+			return false, fmt.Errorf("unsupported constant type")
+		}
+
+		rowVal, ok := rowData[colName]
+		if !ok {
+			return false, fmt.Errorf("column %s not found", colName)
+		}
+
+		// Get operator name
+		opName := ""
+		if len(aExpr.Name) > 0 {
+			opName = aExpr.Name[0].GetString_().GetSval()
+		}
+
+		switch opName {
+		case "=":
+			return rowVal == compareVal, nil
+		case "<>", "!=":
+			return rowVal != compareVal, nil
+		case "<":
+			return rowVal < compareVal, nil
+		case ">":
+			return rowVal > compareVal, nil
+		case "<=":
+			return rowVal <= compareVal, nil
+		case ">=":
+			return rowVal >= compareVal, nil
+		default:
+			return false, fmt.Errorf("unsupported operator: %s", opName)
+		}
+	}
+
+	// Handle BoolExpr (AND, OR, NOT)
+	if boolExpr := expr.GetBoolExpr(); boolExpr != nil {
+		switch boolExpr.Boolop {
+		case pgquery.BoolExprType_AND_EXPR:
+			for _, arg := range boolExpr.Args {
+				result, err := evaluateWhereExpr(arg, rowData)
+				if err != nil {
+					return false, err
+				}
+				if !result {
+					return false, nil
+				}
+			}
+			return true, nil
+		case pgquery.BoolExprType_OR_EXPR:
+			for _, arg := range boolExpr.Args {
+				result, err := evaluateWhereExpr(arg, rowData)
+				if err != nil {
+					return false, err
+				}
+				if result {
+					return true, nil
+				}
+			}
+			return false, nil
+		case pgquery.BoolExprType_NOT_EXPR:
+			if len(boolExpr.Args) > 0 {
+				result, err := evaluateWhereExpr(boolExpr.Args[0], rowData)
+				if err != nil {
+					return false, err
+				}
+				return !result, nil
+			}
+		}
+	}
+
+	return false, fmt.Errorf("unsupported WHERE expression type")
+}
+
 /*
 
 Parse the select statement and return the result.
@@ -447,22 +546,44 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 	}
 
 	results := &pgResult{}
-	for _, c := range stmt.TargetList {
-		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().GetSval()
-		results.fieldNames = append(results.fieldNames, fieldName)
 
-		fieldType := ""
-		for i, cn := range tbl.ColumnNames {
-			if cn == fieldName {
-				fieldType = tbl.ColumnTypes[i]
+	// Check for SELECT * (ColumnRef with A_Star)
+	isSelectStar := false
+	if len(stmt.TargetList) == 1 {
+		target := stmt.TargetList[0].GetResTarget()
+		if target != nil && target.Val != nil {
+			colRef := target.Val.GetColumnRef()
+			if colRef != nil && len(colRef.Fields) == 1 {
+				if colRef.Fields[0].GetAStar() != nil {
+					isSelectStar = true
+				}
 			}
 		}
+	}
 
-		if fieldType == "" {
-			return nil, fmt.Errorf("unknown field: %s", fieldName)
+	if isSelectStar {
+		// SELECT * - use all columns from table definition
+		results.fieldNames = append(results.fieldNames, tbl.ColumnNames...)
+		results.fieldTypes = append(results.fieldTypes, tbl.ColumnTypes...)
+	} else {
+		// Explicit column list
+		for _, c := range stmt.TargetList {
+			fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().GetSval()
+			results.fieldNames = append(results.fieldNames, fieldName)
+
+			fieldType := ""
+			for i, cn := range tbl.ColumnNames {
+				if cn == fieldName {
+					fieldType = tbl.ColumnTypes[i]
+				}
+			}
+
+			if fieldType == "" {
+				return nil, fmt.Errorf("unknown field: %s", fieldName)
+			}
+
+			results.fieldTypes = append(results.fieldTypes, fieldType)
 		}
-
-		results.fieldTypes = append(results.fieldTypes, fieldType)
 	}
 
 	dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
@@ -502,8 +623,20 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 			rowData[currentInternalRowId][currentColumnName] = string(kv.Value)
 		}
 
-		// Build result rows in the requested column order
+		// Build result rows in the requested column order, applying WHERE filter
 		for _, rowId := range rowOrder {
+			// Check WHERE clause
+			if stmt.WhereClause != nil {
+				match, err := evaluateWhereExpr(stmt.WhereClause, rowData[rowId])
+				if err != nil {
+					log.Printf("WHERE evaluation error: %v", err)
+					continue
+				}
+				if !match {
+					continue
+				}
+			}
+
 			row := make([]any, len(results.fieldNames))
 			for colName, val := range rowData[rowId] {
 				if idx, ok := requestedColIndex[colName]; ok {
