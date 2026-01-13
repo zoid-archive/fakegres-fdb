@@ -181,7 +181,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)"},
 		MainSQL:  "DROP TABLE users",
 		Tags:     []string{"ddl", "drop"},
-		Skip:     "DROP TABLE not implemented",
 	},
 
 	// ORDER BY
