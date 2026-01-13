@@ -9,7 +9,7 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/google/uuid"
-	pgquery "github.com/pganalyze/pg_query_go/v2"
+	pgquery "github.com/pganalyze/pg_query_go/v5"
 )
 
 type pgEngine struct {
@@ -102,7 +102,7 @@ func (pe pgEngine) executeCreate(stmt *pgquery.CreateStmt) error {
 				if columnType != "" {
 					columnType += "."
 				}
-				columnType += n.GetString_().Str
+				columnType += n.GetString_().GetSval()
 			}
 			tr.Set(tableSS.Pack(tuple.Tuple{tbl.Name, cd.Colname}), []byte(columnType))
 		}
@@ -236,12 +236,12 @@ func (pe pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 			maxColumnIndex := len(tbl.ColumnNames) - 1
 			for _, value := range values.GetList().Items {
 				if c := value.GetAConst(); c != nil {
-					if s := c.Val.GetString_(); s != nil {
+					if s := c.GetSval(); s != nil {
 						// Columnar data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}), []byte(s.Str))
+						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}), []byte(s.GetSval()))
 						log.Printf("Inserted key c: %s", tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}))
 						// Row based data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}), []byte(s.Str))
+						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}), []byte(s.GetSval()))
 						log.Printf("Inserted key r: %s", tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}))
 
 						if columnIndex < maxColumnIndex {
@@ -250,9 +250,9 @@ func (pe pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 						continue
 					}
 
-					if i := c.Val.GetInteger(); i != nil {
+					if i := c.GetIval(); i != nil {
 						// TODO: better convert in to byte[], with this conversion, it ends up being a string
-						valueJson, _ := json.Marshal(i.Ival)
+						valueJson, _ := json.Marshal(i.GetIval())
 						// Columnar data
 						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}), valueJson)
 						log.Printf("Inserted key c: %s", tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}))
@@ -363,7 +363,7 @@ func (pe pgEngine) executeSelectColumnar(stmt *pgquery.SelectStmt) (*pgResult, e
 
 	results := &pgResult{}
 	for _, c := range stmt.TargetList {
-		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().Str
+		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().GetSval()
 		results.fieldNames = append(results.fieldNames, fieldName)
 
 		fieldType := ""
@@ -448,7 +448,7 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 
 	results := &pgResult{}
 	for _, c := range stmt.TargetList {
-		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().Str
+		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().GetSval()
 		results.fieldNames = append(results.fieldNames, fieldName)
 
 		fieldType := ""
@@ -471,6 +471,12 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 	}
 	tableDataSS := dataDir.Sub("table_data")
 
+	// Build a map of requested column name -> index in result
+	requestedColIndex := make(map[string]int)
+	for i, name := range results.fieldNames {
+		requestedColIndex[name] = i
+	}
+
 	_, _ = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
 		query := tableDataSS.Pack(tuple.Tuple{tbl.Name, "r"})
 		rangeQuery, _ := fdb.PrefixRange(query)
@@ -478,41 +484,35 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 			Mode: fdb.StreamingModeWantAll,
 		}).Iterator()
 
-		var targetRows [][]any
-		targetRows = append(targetRows, []any{})
-		rowIndex := 0
-		columnOrder := []string{}
+		// Group values by row ID
+		rowData := make(map[string]map[string]string)
+		var rowOrder []string
+
 		for ri.Advance() {
 			kv := ri.MustGet()
 			t, _ := tableDataSS.Unpack(kv.Key)
 
-			currentTableName := t[0].(string)
-			currentColumnFormat := t[1].(string)
 			currentInternalRowId := t[2].(string)
 			currentColumnName := t[3].(string)
-			log.Println("fetching row metadata: ", currentTableName, currentColumnFormat, currentColumnName, currentInternalRowId)
 
-			if len(columnOrder) < len(results.fieldNames) {
-				columnOrder = append(columnOrder, currentColumnName)
+			if _, exists := rowData[currentInternalRowId]; !exists {
+				rowData[currentInternalRowId] = make(map[string]string)
+				rowOrder = append(rowOrder, currentInternalRowId)
 			}
-			if len(targetRows[rowIndex]) == len(results.fieldNames) {
-				rowIndex += 1
-				targetRows = append(targetRows, []any{})
-			}
-
-			targetRows[rowIndex] = append(targetRows[rowIndex], string(kv.Value))
+			rowData[currentInternalRowId][currentColumnName] = string(kv.Value)
 		}
-		results.fieldNames = columnOrder
 
-		// TODO: don't add empty arrays in the first place
-		var targetRowsFinal [][]any
-		targetRows = append(targetRows, []any{})
-		for _, row := range targetRows {
-			if len(row) > 0 {
-				targetRowsFinal = append(targetRowsFinal, row)
+		// Build result rows in the requested column order
+		for _, rowId := range rowOrder {
+			row := make([]any, len(results.fieldNames))
+			for colName, val := range rowData[rowId] {
+				if idx, ok := requestedColIndex[colName]; ok {
+					row[idx] = val
+				}
 			}
+			results.rows = append(results.rows, row)
 		}
-		results.rows = targetRowsFinal
+
 		return results, nil
 	})
 
