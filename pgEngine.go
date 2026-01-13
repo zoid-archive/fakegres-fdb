@@ -45,6 +45,10 @@ func (pe pgEngine) execute(tree pgquery.ParseResult) error {
 			return pe.executeDrop(c)
 		}
 
+		if c := n.GetTruncateStmt(); c != nil {
+			return pe.executeTruncate(c)
+		}
+
 		if c := n.GetSelectStmt(); c != nil {
 			_, err := pe.executeSelect(c)
 			return err
@@ -557,6 +561,36 @@ func (pe pgEngine) executeDrop(stmt *pgquery.DropStmt) error {
 		})
 		if err != nil {
 			return fmt.Errorf("could not drop table: %s", err)
+		}
+	}
+	return nil
+}
+
+func (pe pgEngine) executeTruncate(stmt *pgquery.TruncateStmt) error {
+	for _, rel := range stmt.Relations {
+		rangeVar := rel.GetRangeVar()
+		if rangeVar == nil {
+			continue
+		}
+		tblName := rangeVar.Relname
+
+		dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
+		if err != nil {
+			return err
+		}
+		tableDataSS := dataDir.Sub("table_data")
+
+		_, err = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+			// Delete all table data but keep the schema
+			dataRange, _ := fdb.PrefixRange(tableDataSS.Pack(tuple.Tuple{tblName}))
+			ri := tr.GetRange(dataRange, fdb.RangeOptions{Mode: fdb.StreamingModeWantAll}).Iterator()
+			for ri.Advance() {
+				tr.Clear(ri.MustGet().Key)
+			}
+			return nil, nil
+		})
+		if err != nil {
+			return fmt.Errorf("could not truncate table: %s", err)
 		}
 	}
 	return nil
