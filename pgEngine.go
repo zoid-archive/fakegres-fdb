@@ -35,6 +35,10 @@ func (pe pgEngine) execute(tree pgquery.ParseResult) error {
 			return pe.executeDelete(c)
 		}
 
+		if c := n.GetUpdateStmt(); c != nil {
+			return pe.executeUpdate(c)
+		}
+
 		if c := n.GetSelectStmt(); c != nil {
 			_, err := pe.executeSelect(c)
 			return err
@@ -287,13 +291,14 @@ Currently, this doesn't support where clause and deletes all the data from the t
 */
 
 func (pe pgEngine) executeDelete(stmt *pgquery.DeleteStmt) error {
+	tblName := stmt.Relation.Relname
 
 	catalogDir, err := directory.CreateOrOpen(pe.db, []string{"catalog"}, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 	tableSS := catalogDir.Sub("table")
-	tableKey := tableSS.Pack(tuple.Tuple{stmt.Relation.Relname})
+	tableKey := tableSS.Pack(tuple.Tuple{tblName})
 
 	dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
 	if err != nil {
@@ -301,25 +306,179 @@ func (pe pgEngine) executeDelete(stmt *pgquery.DeleteStmt) error {
 	}
 	tableDataSS := dataDir.Sub("table_data")
 
-	// TODO: implement where, delete for now deletes everything from the table
-
 	_, err = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
 		if tr.Get(tableKey).MustGet() == nil {
-			log.Printf("Table %s does not exist", stmt.Relation.Relname)
+			log.Printf("Table %s does not exist", tblName)
 			return nil, nil
 		}
 
-		ri := tr.GetRange(tableDataSS, fdb.RangeOptions{
+		// If no WHERE clause, delete all rows
+		if stmt.WhereClause == nil {
+			query := tableDataSS.Pack(tuple.Tuple{tblName})
+			rangeQuery, _ := fdb.PrefixRange(query)
+			ri := tr.GetRange(rangeQuery, fdb.RangeOptions{
+				Mode: fdb.StreamingModeWantAll,
+			}).Iterator()
+			for ri.Advance() {
+				kv := ri.MustGet()
+				tr.Clear(kv.Key)
+			}
+			return nil, nil
+		}
+
+		// With WHERE clause, we need to:
+		// 1. Scan row-based data to find matching rows
+		// 2. Delete both row and columnar entries for matching rows
+		query := tableDataSS.Pack(tuple.Tuple{tblName, "r"})
+		rangeQuery, _ := fdb.PrefixRange(query)
+		ri := tr.GetRange(rangeQuery, fdb.RangeOptions{
 			Mode: fdb.StreamingModeWantAll,
 		}).Iterator()
+
+		// Group values by row ID
+		rowData := make(map[string]map[string]string)
+		rowKeys := make(map[string][]fdb.Key) // Track keys for each row
+
 		for ri.Advance() {
 			kv := ri.MustGet()
-			tr.Clear(kv.Key)
+			t, _ := tableDataSS.Unpack(kv.Key)
+
+			currentInternalRowId := t[2].(string)
+			currentColumnName := t[3].(string)
+
+			if _, exists := rowData[currentInternalRowId]; !exists {
+				rowData[currentInternalRowId] = make(map[string]string)
+				rowKeys[currentInternalRowId] = []fdb.Key{}
+			}
+			rowData[currentInternalRowId][currentColumnName] = string(kv.Value)
+			rowKeys[currentInternalRowId] = append(rowKeys[currentInternalRowId], kv.Key)
 		}
+
+		// Find rows matching WHERE and delete them
+		for rowId, data := range rowData {
+			match, err := evaluateWhereExpr(stmt.WhereClause, data)
+			if err != nil {
+				log.Printf("WHERE evaluation error: %v", err)
+				continue
+			}
+			if match {
+				// Delete row-based keys
+				for _, key := range rowKeys[rowId] {
+					tr.Clear(key)
+				}
+				// Delete columnar keys for this row
+				for colName := range data {
+					colKey := tableDataSS.Pack(tuple.Tuple{tblName, "c", colName, rowId})
+					tr.Clear(colKey)
+				}
+			}
+		}
+
 		return nil, nil
 	})
 	if err != nil {
-		return fmt.Errorf("could not delete table: %s", err)
+		return fmt.Errorf("could not delete from table: %s", err)
+	}
+	return nil
+}
+
+func (pe pgEngine) executeUpdate(stmt *pgquery.UpdateStmt) error {
+	tblName := stmt.Relation.Relname
+
+	catalogDir, err := directory.CreateOrOpen(pe.db, []string{"catalog"}, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tableSS := catalogDir.Sub("table")
+	tableKey := tableSS.Pack(tuple.Tuple{tblName})
+
+	dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tableDataSS := dataDir.Sub("table_data")
+
+	// Parse SET clause to get column updates
+	updates := make(map[string]string)
+	for _, target := range stmt.TargetList {
+		resTarget := target.GetResTarget()
+		if resTarget == nil {
+			continue
+		}
+		colName := resTarget.Name
+		
+		// Get the value from the expression
+		if aConst := resTarget.Val.GetAConst(); aConst != nil {
+			if sval := aConst.GetSval(); sval != nil {
+				updates[colName] = sval.GetSval()
+			} else if ival := aConst.GetIval(); ival != nil {
+				updates[colName] = fmt.Sprintf("%d", ival.GetIval())
+			}
+		}
+	}
+
+	_, err = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+		if tr.Get(tableKey).MustGet() == nil {
+			log.Printf("Table %s does not exist", tblName)
+			return nil, nil
+		}
+
+		// Scan row-based data
+		query := tableDataSS.Pack(tuple.Tuple{tblName, "r"})
+		rangeQuery, _ := fdb.PrefixRange(query)
+		ri := tr.GetRange(rangeQuery, fdb.RangeOptions{
+			Mode: fdb.StreamingModeWantAll,
+		}).Iterator()
+
+		// Group values by row ID
+		rowData := make(map[string]map[string]string)
+		var rowOrder []string
+
+		for ri.Advance() {
+			kv := ri.MustGet()
+			t, _ := tableDataSS.Unpack(kv.Key)
+
+			currentInternalRowId := t[2].(string)
+			currentColumnName := t[3].(string)
+
+			if _, exists := rowData[currentInternalRowId]; !exists {
+				rowData[currentInternalRowId] = make(map[string]string)
+				rowOrder = append(rowOrder, currentInternalRowId)
+			}
+			rowData[currentInternalRowId][currentColumnName] = string(kv.Value)
+		}
+
+		// Find rows matching WHERE and update them
+		for _, rowId := range rowOrder {
+			data := rowData[rowId]
+
+			// Check WHERE clause
+			if stmt.WhereClause != nil {
+				match, err := evaluateWhereExpr(stmt.WhereClause, data)
+				if err != nil {
+					log.Printf("WHERE evaluation error: %v", err)
+					continue
+				}
+				if !match {
+					continue
+				}
+			}
+
+			// Apply updates
+			for colName, newVal := range updates {
+				// Update row-based storage
+				rowKey := tableDataSS.Pack(tuple.Tuple{tblName, "r", rowId, colName})
+				tr.Set(rowKey, []byte(newVal))
+				// Update columnar storage
+				colKey := tableDataSS.Pack(tuple.Tuple{tblName, "c", colName, rowId})
+				tr.Set(colKey, []byte(newVal))
+			}
+		}
+
+		return nil, nil
+	})
+	if err != nil {
+		return fmt.Errorf("could not update table: %s", err)
 	}
 	return nil
 }

@@ -105,7 +105,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob')"},
 		MainSQL:  "DELETE FROM users WHERE id = 1",
 		Tags:     []string{"dml", "delete", "where"},
-		Skip:     "WHERE clause not implemented",
 	},
 
 	// DML - UPDATE
@@ -115,7 +114,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice')"},
 		MainSQL:  "UPDATE users SET name = 'updated'",
 		Tags:     []string{"dml", "update"},
-		Skip:     "UPDATE not implemented",
 	},
 	{
 		Name:     "update_where_eq",
@@ -123,7 +121,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob')"},
 		MainSQL:  "UPDATE users SET name = 'updated' WHERE id = 1",
 		Tags:     []string{"dml", "update", "where"},
-		Skip:     "UPDATE not implemented",
 	},
 
 	// WHERE clauses
