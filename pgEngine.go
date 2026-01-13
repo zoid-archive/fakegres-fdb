@@ -221,6 +221,21 @@ func (pe pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 		return err
 	}
 
+	// Determine column order: use explicit list or default to table definition
+	var columnOrder []string
+	if len(stmt.Cols) > 0 {
+		// Explicit column list: INSERT INTO tbl (col1, col2) VALUES ...
+		for _, col := range stmt.Cols {
+			resTarget := col.GetResTarget()
+			if resTarget != nil {
+				columnOrder = append(columnOrder, resTarget.Name)
+			}
+		}
+	} else {
+		// Use table column order
+		columnOrder = tbl.ColumnNames
+	}
+
 	catalogDir, err := directory.CreateOrOpen(pe.db, []string{"catalog"}, nil)
 	if err != nil {
 		log.Fatal(err)
@@ -242,39 +257,38 @@ func (pe pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 
 		for _, values := range slct.ValuesLists {
 			id := uuid.New().String()
-			columnIndex := 0
-			maxColumnIndex := len(tbl.ColumnNames) - 1
-			for _, value := range values.GetList().Items {
+			items := values.GetList().Items
+
+			for columnIndex, value := range items {
+				if columnIndex >= len(columnOrder) {
+					break
+				}
+				colName := columnOrder[columnIndex]
+
 				if c := value.GetAConst(); c != nil {
+					var valBytes []byte
+
 					if s := c.GetSval(); s != nil {
-						// Columnar data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}), []byte(s.GetSval()))
-						log.Printf("Inserted key c: %s", tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}))
-						// Row based data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}), []byte(s.GetSval()))
-						log.Printf("Inserted key r: %s", tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}))
-
-						if columnIndex < maxColumnIndex {
-							columnIndex += 1
+						valBytes = []byte(s.GetSval())
+					} else if i := c.GetIval(); i != nil {
+						valBytes, _ = json.Marshal(i.GetIval())
+					} else if c.GetIsnull() {
+						valBytes = nil // NULL value
+					} else if b := c.GetBoolval(); b != nil {
+						if b.GetBoolval() {
+							valBytes = []byte("true")
+						} else {
+							valBytes = []byte("false")
 						}
-						continue
+					} else {
+						return nil, fmt.Errorf("unsupported constant type")
 					}
 
-					if i := c.GetIval(); i != nil {
-						// TODO: better convert in to byte[], with this conversion, it ends up being a string
-						valueJson, _ := json.Marshal(i.GetIval())
-						// Columnar data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}), valueJson)
-						log.Printf("Inserted key c: %s", tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}))
-						// Row based data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}), valueJson)
-						log.Printf("Inserted key r: %s", tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}))
-
-						if columnIndex < maxColumnIndex {
-							columnIndex += 1
-						}
-						continue
-					}
+					// Columnar data
+					tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", colName, id}), valBytes)
+					// Row based data
+					tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "r", id, colName}), valBytes)
+					continue
 				}
 
 				return nil, fmt.Errorf("unknown value type: %s", value)

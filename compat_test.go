@@ -260,7 +260,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)"},
 		MainSQL:  "INSERT INTO users VALUES (1, NULL)",
 		Tags:     []string{"dml", "insert", "null"},
-		Skip:     "NULL handling not implemented",
 	},
 
 	// INSERT with column list
@@ -270,7 +269,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{"CREATE TABLE users (id int, name text)"},
 		MainSQL:  "INSERT INTO users (name, id) VALUES ('alice', 1)",
 		Tags:     []string{"dml", "insert"},
-		Skip:     "INSERT with column list not implemented",
 	},
 
 	// Boolean type
@@ -280,7 +278,6 @@ var testCases = []SQLTestCase{
 		SetupSQL: []string{},
 		MainSQL:  "CREATE TABLE flags (id int, active bool)",
 		Tags:     []string{"ddl", "create", "types"},
-		Skip:     "Boolean type not fully implemented",
 	},
 
 	// TRUNCATE
