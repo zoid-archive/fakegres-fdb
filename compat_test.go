@@ -288,6 +288,75 @@ var testCases = []SQLTestCase{
 		MainSQL:  "TRUNCATE TABLE users",
 		Tags:     []string{"ddl", "truncate"},
 	},
+
+	// Combined operations
+	{
+		Name:     "insert_select_delete_cycle",
+		Kind:     KindQuery,
+		SetupSQL: []string{
+			"CREATE TABLE users (id int, name text)",
+			"INSERT INTO users VALUES (1, 'alice'), (2, 'bob')",
+			"DELETE FROM users WHERE id = 1",
+		},
+		MainSQL: "SELECT id, name FROM users",
+		Tags:    []string{"dml", "select", "delete", "combined"},
+	},
+	{
+		Name:     "update_then_select",
+		Kind:     KindQuery,
+		SetupSQL: []string{
+			"CREATE TABLE users (id int, name text)",
+			"INSERT INTO users VALUES (1, 'alice')",
+			"UPDATE users SET name = 'updated' WHERE id = 1",
+		},
+		MainSQL: "SELECT name FROM users WHERE id = 1",
+		Tags:    []string{"dml", "select", "update", "combined"},
+	},
+	{
+		Name:     "select_where_gte",
+		Kind:     KindQuery,
+		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')"},
+		MainSQL:  "SELECT id, name FROM users WHERE id >= 2",
+		Tags:     []string{"dml", "select", "where"},
+	},
+	{
+		Name:     "select_where_lte",
+		Kind:     KindQuery,
+		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')"},
+		MainSQL:  "SELECT id, name FROM users WHERE id <= 2",
+		Tags:     []string{"dml", "select", "where"},
+	},
+	{
+		Name:     "select_order_by_text",
+		Kind:     KindQuery,
+		SetupSQL: []string{"CREATE TABLE users (id int, name text)", "INSERT INTO users VALUES (1, 'charlie'), (2, 'alice'), (3, 'bob')"},
+		MainSQL:  "SELECT id, name FROM users ORDER BY name ASC",
+		Tags:     []string{"dml", "select", "order-by"},
+	},
+	{
+		Name:     "drop_table_if_exists",
+		Kind:     KindExec,
+		SetupSQL: []string{},
+		MainSQL:  "DROP TABLE IF EXISTS nonexistent",
+		Tags:     []string{"ddl", "drop"},
+	},
+	{
+		Name:     "select_empty_table",
+		Kind:     KindQuery,
+		SetupSQL: []string{"CREATE TABLE users (id int, name text)"},
+		MainSQL:  "SELECT * FROM users",
+		Tags:     []string{"dml", "select"},
+	},
+	{
+		Name:     "insert_multiple_then_count",
+		Kind:     KindQuery,
+		SetupSQL: []string{
+			"CREATE TABLE users (id int, name text)",
+			"INSERT INTO users VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+		},
+		MainSQL: "SELECT id FROM users ORDER BY id LIMIT 3 OFFSET 1",
+		Tags:    []string{"dml", "select", "limit", "offset", "order-by"},
+	},
 }
 
 func getTestConn(t *testing.T) *pgx.Conn {
