@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
 	"github.com/google/uuid"
-	pgquery "github.com/pganalyze/pg_query_go/v2"
+	pgquery "github.com/pganalyze/pg_query_go/v5"
 )
 
 type pgEngine struct {
@@ -33,6 +35,18 @@ func (pe pgEngine) execute(tree pgquery.ParseResult) error {
 
 		if c := n.GetDeleteStmt(); c != nil {
 			return pe.executeDelete(c)
+		}
+
+		if c := n.GetUpdateStmt(); c != nil {
+			return pe.executeUpdate(c)
+		}
+
+		if c := n.GetDropStmt(); c != nil {
+			return pe.executeDrop(c)
+		}
+
+		if c := n.GetTruncateStmt(); c != nil {
+			return pe.executeTruncate(c)
 		}
 
 		if c := n.GetSelectStmt(); c != nil {
@@ -102,7 +116,7 @@ func (pe pgEngine) executeCreate(stmt *pgquery.CreateStmt) error {
 				if columnType != "" {
 					columnType += "."
 				}
-				columnType += n.GetString_().Str
+				columnType += n.GetString_().GetSval()
 			}
 			tr.Set(tableSS.Pack(tuple.Tuple{tbl.Name, cd.Colname}), []byte(columnType))
 		}
@@ -211,6 +225,21 @@ func (pe pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 		return err
 	}
 
+	// Determine column order: use explicit list or default to table definition
+	var columnOrder []string
+	if len(stmt.Cols) > 0 {
+		// Explicit column list: INSERT INTO tbl (col1, col2) VALUES ...
+		for _, col := range stmt.Cols {
+			resTarget := col.GetResTarget()
+			if resTarget != nil {
+				columnOrder = append(columnOrder, resTarget.Name)
+			}
+		}
+	} else {
+		// Use table column order
+		columnOrder = tbl.ColumnNames
+	}
+
 	catalogDir, err := directory.CreateOrOpen(pe.db, []string{"catalog"}, nil)
 	if err != nil {
 		log.Fatal(err)
@@ -232,39 +261,38 @@ func (pe pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 
 		for _, values := range slct.ValuesLists {
 			id := uuid.New().String()
-			columnIndex := 0
-			maxColumnIndex := len(tbl.ColumnNames) - 1
-			for _, value := range values.GetList().Items {
+			items := values.GetList().Items
+
+			for columnIndex, value := range items {
+				if columnIndex >= len(columnOrder) {
+					break
+				}
+				colName := columnOrder[columnIndex]
+
 				if c := value.GetAConst(); c != nil {
-					if s := c.Val.GetString_(); s != nil {
-						// Columnar data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}), []byte(s.Str))
-						log.Printf("Inserted key c: %s", tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}))
-						// Row based data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}), []byte(s.Str))
-						log.Printf("Inserted key r: %s", tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}))
+					var valBytes []byte
 
-						if columnIndex < maxColumnIndex {
-							columnIndex += 1
+					if s := c.GetSval(); s != nil {
+						valBytes = []byte(s.GetSval())
+					} else if i := c.GetIval(); i != nil {
+						valBytes, _ = json.Marshal(i.GetIval())
+					} else if c.GetIsnull() {
+						valBytes = nil // NULL value
+					} else if b := c.GetBoolval(); b != nil {
+						if b.GetBoolval() {
+							valBytes = []byte("true")
+						} else {
+							valBytes = []byte("false")
 						}
-						continue
+					} else {
+						return nil, fmt.Errorf("unsupported constant type")
 					}
 
-					if i := c.Val.GetInteger(); i != nil {
-						// TODO: better convert in to byte[], with this conversion, it ends up being a string
-						valueJson, _ := json.Marshal(i.Ival)
-						// Columnar data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}), valueJson)
-						log.Printf("Inserted key c: %s", tableDataSS.Pack(tuple.Tuple{tblName, "c", tbl.ColumnNames[columnIndex], id}))
-						// Row based data
-						tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}), valueJson)
-						log.Printf("Inserted key r: %s", tableDataSS.Pack(tuple.Tuple{tblName, "r", id, tbl.ColumnNames[columnIndex]}))
-
-						if columnIndex < maxColumnIndex {
-							columnIndex += 1
-						}
-						continue
-					}
+					// Columnar data
+					tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "c", colName, id}), valBytes)
+					// Row based data
+					tr.Set(tableDataSS.Pack(tuple.Tuple{tblName, "r", id, colName}), valBytes)
+					continue
 				}
 
 				return nil, fmt.Errorf("unknown value type: %s", value)
@@ -287,13 +315,14 @@ Currently, this doesn't support where clause and deletes all the data from the t
 */
 
 func (pe pgEngine) executeDelete(stmt *pgquery.DeleteStmt) error {
+	tblName := stmt.Relation.Relname
 
 	catalogDir, err := directory.CreateOrOpen(pe.db, []string{"catalog"}, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 	tableSS := catalogDir.Sub("table")
-	tableKey := tableSS.Pack(tuple.Tuple{stmt.Relation.Relname})
+	tableKey := tableSS.Pack(tuple.Tuple{tblName})
 
 	dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
 	if err != nil {
@@ -301,25 +330,268 @@ func (pe pgEngine) executeDelete(stmt *pgquery.DeleteStmt) error {
 	}
 	tableDataSS := dataDir.Sub("table_data")
 
-	// TODO: implement where, delete for now deletes everything from the table
-
 	_, err = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
 		if tr.Get(tableKey).MustGet() == nil {
-			log.Printf("Table %s does not exist", stmt.Relation.Relname)
+			log.Printf("Table %s does not exist", tblName)
 			return nil, nil
 		}
 
-		ri := tr.GetRange(tableDataSS, fdb.RangeOptions{
+		// If no WHERE clause, delete all rows
+		if stmt.WhereClause == nil {
+			query := tableDataSS.Pack(tuple.Tuple{tblName})
+			rangeQuery, _ := fdb.PrefixRange(query)
+			ri := tr.GetRange(rangeQuery, fdb.RangeOptions{
+				Mode: fdb.StreamingModeWantAll,
+			}).Iterator()
+			for ri.Advance() {
+				kv := ri.MustGet()
+				tr.Clear(kv.Key)
+			}
+			return nil, nil
+		}
+
+		// With WHERE clause, we need to:
+		// 1. Scan row-based data to find matching rows
+		// 2. Delete both row and columnar entries for matching rows
+		query := tableDataSS.Pack(tuple.Tuple{tblName, "r"})
+		rangeQuery, _ := fdb.PrefixRange(query)
+		ri := tr.GetRange(rangeQuery, fdb.RangeOptions{
 			Mode: fdb.StreamingModeWantAll,
 		}).Iterator()
+
+		// Group values by row ID
+		rowData := make(map[string]map[string]string)
+		rowKeys := make(map[string][]fdb.Key) // Track keys for each row
+
 		for ri.Advance() {
 			kv := ri.MustGet()
-			tr.Clear(kv.Key)
+			t, _ := tableDataSS.Unpack(kv.Key)
+
+			currentInternalRowId := t[2].(string)
+			currentColumnName := t[3].(string)
+
+			if _, exists := rowData[currentInternalRowId]; !exists {
+				rowData[currentInternalRowId] = make(map[string]string)
+				rowKeys[currentInternalRowId] = []fdb.Key{}
+			}
+			rowData[currentInternalRowId][currentColumnName] = string(kv.Value)
+			rowKeys[currentInternalRowId] = append(rowKeys[currentInternalRowId], kv.Key)
 		}
+
+		// Find rows matching WHERE and delete them
+		for rowId, data := range rowData {
+			match, err := evaluateWhereExpr(stmt.WhereClause, data)
+			if err != nil {
+				log.Printf("WHERE evaluation error: %v", err)
+				continue
+			}
+			if match {
+				// Delete row-based keys
+				for _, key := range rowKeys[rowId] {
+					tr.Clear(key)
+				}
+				// Delete columnar keys for this row
+				for colName := range data {
+					colKey := tableDataSS.Pack(tuple.Tuple{tblName, "c", colName, rowId})
+					tr.Clear(colKey)
+				}
+			}
+		}
+
 		return nil, nil
 	})
 	if err != nil {
-		return fmt.Errorf("could not delete table: %s", err)
+		return fmt.Errorf("could not delete from table: %s", err)
+	}
+	return nil
+}
+
+func (pe pgEngine) executeUpdate(stmt *pgquery.UpdateStmt) error {
+	tblName := stmt.Relation.Relname
+
+	catalogDir, err := directory.CreateOrOpen(pe.db, []string{"catalog"}, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tableSS := catalogDir.Sub("table")
+	tableKey := tableSS.Pack(tuple.Tuple{tblName})
+
+	dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tableDataSS := dataDir.Sub("table_data")
+
+	// Parse SET clause to get column updates
+	updates := make(map[string]string)
+	for _, target := range stmt.TargetList {
+		resTarget := target.GetResTarget()
+		if resTarget == nil {
+			continue
+		}
+		colName := resTarget.Name
+		
+		// Get the value from the expression
+		if aConst := resTarget.Val.GetAConst(); aConst != nil {
+			if sval := aConst.GetSval(); sval != nil {
+				updates[colName] = sval.GetSval()
+			} else if ival := aConst.GetIval(); ival != nil {
+				updates[colName] = fmt.Sprintf("%d", ival.GetIval())
+			}
+		}
+	}
+
+	_, err = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+		if tr.Get(tableKey).MustGet() == nil {
+			log.Printf("Table %s does not exist", tblName)
+			return nil, nil
+		}
+
+		// Scan row-based data
+		query := tableDataSS.Pack(tuple.Tuple{tblName, "r"})
+		rangeQuery, _ := fdb.PrefixRange(query)
+		ri := tr.GetRange(rangeQuery, fdb.RangeOptions{
+			Mode: fdb.StreamingModeWantAll,
+		}).Iterator()
+
+		// Group values by row ID
+		rowData := make(map[string]map[string]string)
+		var rowOrder []string
+
+		for ri.Advance() {
+			kv := ri.MustGet()
+			t, _ := tableDataSS.Unpack(kv.Key)
+
+			currentInternalRowId := t[2].(string)
+			currentColumnName := t[3].(string)
+
+			if _, exists := rowData[currentInternalRowId]; !exists {
+				rowData[currentInternalRowId] = make(map[string]string)
+				rowOrder = append(rowOrder, currentInternalRowId)
+			}
+			rowData[currentInternalRowId][currentColumnName] = string(kv.Value)
+		}
+
+		// Find rows matching WHERE and update them
+		for _, rowId := range rowOrder {
+			data := rowData[rowId]
+
+			// Check WHERE clause
+			if stmt.WhereClause != nil {
+				match, err := evaluateWhereExpr(stmt.WhereClause, data)
+				if err != nil {
+					log.Printf("WHERE evaluation error: %v", err)
+					continue
+				}
+				if !match {
+					continue
+				}
+			}
+
+			// Apply updates
+			for colName, newVal := range updates {
+				// Update row-based storage
+				rowKey := tableDataSS.Pack(tuple.Tuple{tblName, "r", rowId, colName})
+				tr.Set(rowKey, []byte(newVal))
+				// Update columnar storage
+				colKey := tableDataSS.Pack(tuple.Tuple{tblName, "c", colName, rowId})
+				tr.Set(colKey, []byte(newVal))
+			}
+		}
+
+		return nil, nil
+	})
+	if err != nil {
+		return fmt.Errorf("could not update table: %s", err)
+	}
+	return nil
+}
+
+func (pe pgEngine) executeDrop(stmt *pgquery.DropStmt) error {
+	// Only handle DROP TABLE for now
+	if stmt.RemoveType != pgquery.ObjectType_OBJECT_TABLE {
+		return fmt.Errorf("DROP only supported for tables")
+	}
+
+	for _, obj := range stmt.Objects {
+		// Object is a List containing the table name
+		list := obj.GetList()
+		if list == nil || len(list.Items) == 0 {
+			continue
+		}
+		tblName := list.Items[0].GetString_().GetSval()
+
+		catalogDir, err := directory.CreateOrOpen(pe.db, []string{"catalog"}, nil)
+		if err != nil {
+			return err
+		}
+		tableSS := catalogDir.Sub("table")
+
+		dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
+		if err != nil {
+			return err
+		}
+		tableDataSS := dataDir.Sub("table_data")
+
+		_, err = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+			// Check if table exists
+			tableKey := tableSS.Pack(tuple.Tuple{tblName})
+			if tr.Get(tableKey).MustGet() == nil {
+				if !stmt.MissingOk {
+					return nil, fmt.Errorf("table %s does not exist", tblName)
+				}
+				return nil, nil
+			}
+
+			// Delete table metadata from catalog
+			catalogRange, _ := fdb.PrefixRange(tableSS.Pack(tuple.Tuple{tblName}))
+			ri := tr.GetRange(catalogRange, fdb.RangeOptions{Mode: fdb.StreamingModeWantAll}).Iterator()
+			for ri.Advance() {
+				tr.Clear(ri.MustGet().Key)
+			}
+
+			// Delete all table data
+			dataRange, _ := fdb.PrefixRange(tableDataSS.Pack(tuple.Tuple{tblName}))
+			ri = tr.GetRange(dataRange, fdb.RangeOptions{Mode: fdb.StreamingModeWantAll}).Iterator()
+			for ri.Advance() {
+				tr.Clear(ri.MustGet().Key)
+			}
+
+			return nil, nil
+		})
+		if err != nil {
+			return fmt.Errorf("could not drop table: %s", err)
+		}
+	}
+	return nil
+}
+
+func (pe pgEngine) executeTruncate(stmt *pgquery.TruncateStmt) error {
+	for _, rel := range stmt.Relations {
+		rangeVar := rel.GetRangeVar()
+		if rangeVar == nil {
+			continue
+		}
+		tblName := rangeVar.Relname
+
+		dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
+		if err != nil {
+			return err
+		}
+		tableDataSS := dataDir.Sub("table_data")
+
+		_, err = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+			// Delete all table data but keep the schema
+			dataRange, _ := fdb.PrefixRange(tableDataSS.Pack(tuple.Tuple{tblName}))
+			ri := tr.GetRange(dataRange, fdb.RangeOptions{Mode: fdb.StreamingModeWantAll}).Iterator()
+			for ri.Advance() {
+				tr.Clear(ri.MustGet().Key)
+			}
+			return nil, nil
+		})
+		if err != nil {
+			return fmt.Errorf("could not truncate table: %s", err)
+		}
 	}
 	return nil
 }
@@ -328,6 +600,105 @@ type pgResult struct {
 	fieldNames []string
 	fieldTypes []string
 	rows       [][]any
+}
+
+// evaluateWhereExpr evaluates a WHERE expression against a row
+// Returns true if the row matches the condition
+func evaluateWhereExpr(expr *pgquery.Node, rowData map[string]string) (bool, error) {
+	if expr == nil {
+		return true, nil
+	}
+
+	// Handle A_Expr (comparison operators like =, <>, <, >, <=, >=)
+	if aExpr := expr.GetAExpr(); aExpr != nil {
+		// Get column name from left side
+		leftColRef := aExpr.Lexpr.GetColumnRef()
+		if leftColRef == nil || len(leftColRef.Fields) == 0 {
+			return false, fmt.Errorf("left side of comparison must be a column")
+		}
+		colName := leftColRef.Fields[0].GetString_().GetSval()
+
+		// Get value from right side
+		rightConst := aExpr.Rexpr.GetAConst()
+		if rightConst == nil {
+			return false, fmt.Errorf("right side of comparison must be a constant")
+		}
+
+		var compareVal string
+		if sval := rightConst.GetSval(); sval != nil {
+			compareVal = sval.GetSval()
+		} else if ival := rightConst.GetIval(); ival != nil {
+			compareVal = fmt.Sprintf("%d", ival.GetIval())
+		} else {
+			return false, fmt.Errorf("unsupported constant type")
+		}
+
+		rowVal, ok := rowData[colName]
+		if !ok {
+			return false, fmt.Errorf("column %s not found", colName)
+		}
+
+		// Get operator name
+		opName := ""
+		if len(aExpr.Name) > 0 {
+			opName = aExpr.Name[0].GetString_().GetSval()
+		}
+
+		switch opName {
+		case "=":
+			return rowVal == compareVal, nil
+		case "<>", "!=":
+			return rowVal != compareVal, nil
+		case "<":
+			return rowVal < compareVal, nil
+		case ">":
+			return rowVal > compareVal, nil
+		case "<=":
+			return rowVal <= compareVal, nil
+		case ">=":
+			return rowVal >= compareVal, nil
+		default:
+			return false, fmt.Errorf("unsupported operator: %s", opName)
+		}
+	}
+
+	// Handle BoolExpr (AND, OR, NOT)
+	if boolExpr := expr.GetBoolExpr(); boolExpr != nil {
+		switch boolExpr.Boolop {
+		case pgquery.BoolExprType_AND_EXPR:
+			for _, arg := range boolExpr.Args {
+				result, err := evaluateWhereExpr(arg, rowData)
+				if err != nil {
+					return false, err
+				}
+				if !result {
+					return false, nil
+				}
+			}
+			return true, nil
+		case pgquery.BoolExprType_OR_EXPR:
+			for _, arg := range boolExpr.Args {
+				result, err := evaluateWhereExpr(arg, rowData)
+				if err != nil {
+					return false, err
+				}
+				if result {
+					return true, nil
+				}
+			}
+			return false, nil
+		case pgquery.BoolExprType_NOT_EXPR:
+			if len(boolExpr.Args) > 0 {
+				result, err := evaluateWhereExpr(boolExpr.Args[0], rowData)
+				if err != nil {
+					return false, err
+				}
+				return !result, nil
+			}
+		}
+	}
+
+	return false, fmt.Errorf("unsupported WHERE expression type")
 }
 
 /*
@@ -363,7 +734,7 @@ func (pe pgEngine) executeSelectColumnar(stmt *pgquery.SelectStmt) (*pgResult, e
 
 	results := &pgResult{}
 	for _, c := range stmt.TargetList {
-		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().Str
+		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().GetSval()
 		results.fieldNames = append(results.fieldNames, fieldName)
 
 		fieldType := ""
@@ -447,22 +818,44 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 	}
 
 	results := &pgResult{}
-	for _, c := range stmt.TargetList {
-		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().Str
-		results.fieldNames = append(results.fieldNames, fieldName)
 
-		fieldType := ""
-		for i, cn := range tbl.ColumnNames {
-			if cn == fieldName {
-				fieldType = tbl.ColumnTypes[i]
+	// Check for SELECT * (ColumnRef with A_Star)
+	isSelectStar := false
+	if len(stmt.TargetList) == 1 {
+		target := stmt.TargetList[0].GetResTarget()
+		if target != nil && target.Val != nil {
+			colRef := target.Val.GetColumnRef()
+			if colRef != nil && len(colRef.Fields) == 1 {
+				if colRef.Fields[0].GetAStar() != nil {
+					isSelectStar = true
+				}
 			}
 		}
+	}
 
-		if fieldType == "" {
-			return nil, fmt.Errorf("unknown field: %s", fieldName)
+	if isSelectStar {
+		// SELECT * - use all columns from table definition
+		results.fieldNames = append(results.fieldNames, tbl.ColumnNames...)
+		results.fieldTypes = append(results.fieldTypes, tbl.ColumnTypes...)
+	} else {
+		// Explicit column list
+		for _, c := range stmt.TargetList {
+			fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().GetSval()
+			results.fieldNames = append(results.fieldNames, fieldName)
+
+			fieldType := ""
+			for i, cn := range tbl.ColumnNames {
+				if cn == fieldName {
+					fieldType = tbl.ColumnTypes[i]
+				}
+			}
+
+			if fieldType == "" {
+				return nil, fmt.Errorf("unknown field: %s", fieldName)
+			}
+
+			results.fieldTypes = append(results.fieldTypes, fieldType)
 		}
-
-		results.fieldTypes = append(results.fieldTypes, fieldType)
 	}
 
 	dataDir, err := directory.CreateOrOpen(pe.db, []string{"data"}, nil)
@@ -471,6 +864,12 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 	}
 	tableDataSS := dataDir.Sub("table_data")
 
+	// Build a map of requested column name -> index in result
+	requestedColIndex := make(map[string]int)
+	for i, name := range results.fieldNames {
+		requestedColIndex[name] = i
+	}
+
 	_, _ = pe.db.Transact(func(tr fdb.Transaction) (interface{}, error) {
 		query := tableDataSS.Pack(tuple.Tuple{tbl.Name, "r"})
 		rangeQuery, _ := fdb.PrefixRange(query)
@@ -478,43 +877,115 @@ func (pe pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 			Mode: fdb.StreamingModeWantAll,
 		}).Iterator()
 
-		var targetRows [][]any
-		targetRows = append(targetRows, []any{})
-		rowIndex := 0
-		columnOrder := []string{}
+		// Group values by row ID
+		rowData := make(map[string]map[string]string)
+		var rowOrder []string
+
 		for ri.Advance() {
 			kv := ri.MustGet()
 			t, _ := tableDataSS.Unpack(kv.Key)
 
-			currentTableName := t[0].(string)
-			currentColumnFormat := t[1].(string)
 			currentInternalRowId := t[2].(string)
 			currentColumnName := t[3].(string)
-			log.Println("fetching row metadata: ", currentTableName, currentColumnFormat, currentColumnName, currentInternalRowId)
 
-			if len(columnOrder) < len(results.fieldNames) {
-				columnOrder = append(columnOrder, currentColumnName)
+			if _, exists := rowData[currentInternalRowId]; !exists {
+				rowData[currentInternalRowId] = make(map[string]string)
+				rowOrder = append(rowOrder, currentInternalRowId)
 			}
-			if len(targetRows[rowIndex]) == len(results.fieldNames) {
-				rowIndex += 1
-				targetRows = append(targetRows, []any{})
-			}
-
-			targetRows[rowIndex] = append(targetRows[rowIndex], string(kv.Value))
+			rowData[currentInternalRowId][currentColumnName] = string(kv.Value)
 		}
-		results.fieldNames = columnOrder
 
-		// TODO: don't add empty arrays in the first place
-		var targetRowsFinal [][]any
-		targetRows = append(targetRows, []any{})
-		for _, row := range targetRows {
-			if len(row) > 0 {
-				targetRowsFinal = append(targetRowsFinal, row)
+		// Build result rows in the requested column order, applying WHERE filter
+		for _, rowId := range rowOrder {
+			// Check WHERE clause
+			if stmt.WhereClause != nil {
+				match, err := evaluateWhereExpr(stmt.WhereClause, rowData[rowId])
+				if err != nil {
+					log.Printf("WHERE evaluation error: %v", err)
+					continue
+				}
+				if !match {
+					continue
+				}
 			}
+
+			row := make([]any, len(results.fieldNames))
+			for colName, val := range rowData[rowId] {
+				if idx, ok := requestedColIndex[colName]; ok {
+					row[idx] = val
+				}
+			}
+			results.rows = append(results.rows, row)
 		}
-		results.rows = targetRowsFinal
+
 		return results, nil
 	})
+
+	// Apply ORDER BY
+	if len(stmt.SortClause) > 0 {
+		sortBy := stmt.SortClause[0].GetSortBy()
+		if sortBy != nil {
+			sortColName := sortBy.Node.GetColumnRef().Fields[0].GetString_().GetSval()
+			sortColIdx := -1
+			for i, name := range results.fieldNames {
+				if name == sortColName {
+					sortColIdx = i
+					break
+				}
+			}
+
+			if sortColIdx >= 0 {
+				isDesc := sortBy.SortbyDir == pgquery.SortByDir_SORTBY_DESC
+
+				sort.SliceStable(results.rows, func(i, j int) bool {
+					vi := fmt.Sprintf("%v", results.rows[i][sortColIdx])
+					vj := fmt.Sprintf("%v", results.rows[j][sortColIdx])
+
+					// Try numeric comparison first
+					ni, errI := strconv.ParseFloat(vi, 64)
+					nj, errJ := strconv.ParseFloat(vj, 64)
+					if errI == nil && errJ == nil {
+						if isDesc {
+							return ni > nj
+						}
+						return ni < nj
+					}
+
+					// Fall back to string comparison
+					if isDesc {
+						return vi > vj
+					}
+					return vi < vj
+				})
+			}
+		}
+	}
+
+	// Apply LIMIT
+	if stmt.LimitCount != nil {
+		if limitConst := stmt.LimitCount.GetAConst(); limitConst != nil {
+			if limitVal := limitConst.GetIval(); limitVal != nil {
+				limit := int(limitVal.GetIval())
+				if limit < len(results.rows) {
+					results.rows = results.rows[:limit]
+				}
+			}
+		}
+	}
+
+	// Apply OFFSET
+	if stmt.LimitOffset != nil {
+		if offsetConst := stmt.LimitOffset.GetAConst(); offsetConst != nil {
+			if offsetVal := offsetConst.GetIval(); offsetVal != nil {
+				offset := int(offsetVal.GetIval())
+				if offset < len(results.rows) {
+					results.rows = results.rows[offset:]
+				} else {
+					results.rows = nil
+				}
+			}
+		}
+	}
 
 	return results, nil
 }

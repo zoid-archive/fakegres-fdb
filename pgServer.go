@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -10,7 +9,7 @@ import (
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 
 	"github.com/jackc/pgproto3/v2"
-	pgquery "github.com/pganalyze/pg_query_go/v2"
+	pgquery "github.com/pganalyze/pg_query_go/v5"
 )
 
 var dataTypeOIDMap = map[string]uint32{
@@ -45,12 +44,16 @@ func (pgs pgServer) writePgResult(res *pgResult) {
 	for _, row := range res.rows {
 		dr := &pgproto3.DataRow{}
 		for _, value := range row {
-			bs, err := json.Marshal(value)
-			if err != nil {
-				log.Printf("Failed to marshal cell: %s\n", err)
-				return
+			// Convert value to string representation for text format
+			var bs []byte
+			switch v := value.(type) {
+			case string:
+				bs = []byte(v)
+			case nil:
+				bs = nil
+			default:
+				bs = []byte(fmt.Sprintf("%v", v))
 			}
-
 			dr.Values = append(dr.Values, bs)
 		}
 
@@ -69,6 +72,14 @@ func (pgs pgServer) handleStartupMessage(pgconn *pgproto3.Backend) error {
 	switch startupMessage.(type) {
 	case *pgproto3.StartupMessage:
 		buf := (&pgproto3.AuthenticationOk{}).Encode(nil)
+		// Send required parameter statuses
+		buf = (&pgproto3.ParameterStatus{Name: "server_version", Value: "15.0"}).Encode(buf)
+		buf = (&pgproto3.ParameterStatus{Name: "server_encoding", Value: "UTF8"}).Encode(buf)
+		buf = (&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"}).Encode(buf)
+		buf = (&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"}).Encode(buf)
+		buf = (&pgproto3.ParameterStatus{Name: "TimeZone", Value: "UTC"}).Encode(buf)
+		buf = (&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"}).Encode(buf)
+		buf = (&pgproto3.ParameterStatus{Name: "integer_datetimes", Value: "on"}).Encode(buf)
 		buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 		_, err = pgs.conn.Write(buf)
 		if err != nil {
