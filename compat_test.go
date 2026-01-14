@@ -1,16 +1,60 @@
+//go:build integration
+
 package main
 
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/jackc/pgx/v5"
 )
+
+func TestMain(m *testing.M) {
+	host := os.Getenv("FAKEGRES_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("FAKEGRES_PORT")
+	if port == "" {
+		port = "6000"
+	}
+
+	addr := net.JoinHostPort(host, port)
+	conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		os.Exit(m.Run())
+	}
+
+	fdb.MustAPIVersion(710)
+	db := fdb.MustOpenDefault()
+
+	db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+		tr.ClearRange(fdb.KeyRange{Begin: fdb.Key{}, End: fdb.Key{0xFF}})
+		return nil, nil
+	})
+
+	cfg := config{pgPort: port}
+	go runPgServer(port, db, cfg)
+
+	for i := 0; i < 50; i++ {
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	os.Exit(m.Run())
+}
 
 type QueryKind string
 
